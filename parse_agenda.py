@@ -81,9 +81,53 @@ def item_type_from_section(section_type):
     return "other"
 
 
+def extract_links(doc):
+    """Extract hyperlinks from the PDF and return lookup dicts.
+
+    Returns:
+        file_number_urls: dict mapping normalized file number (e.g. "Ord. 26-009")
+                          to URL string
+        claims_urls: list of (url, link_text) for claims-related links, in page order
+    """
+    file_number_urls = {}
+    claims_urls = []
+    seen_claims_urls = set()
+
+    file_num_in_link = re.compile(r'((?:Ord|Res)\.?\s*\d{2}-\d{3})')
+
+    for page in doc:
+        for link in page.get_links():
+            uri = link.get("uri")
+            if not uri:
+                continue
+            # Extract the visible text at the link rectangle
+            rect = fitz.Rect(link["from"])
+            text = page.get_text("text", clip=rect).strip()
+
+            # Check if this link text contains a file number
+            fm = file_num_in_link.search(text)
+            if fm:
+                # Normalize: "Ord.26-009" or "Res. 26-068" → "Ord. 26-009"
+                raw = fm.group(1)
+                normalized = re.sub(r'(Ord|Res)\.?\s*', r'\1. ', raw)
+                file_number_urls[normalized] = uri
+            else:
+                # Non-file-number links (claims, meeting links, etc.)
+                # Deduplicate by URL for claims (same URL spans multiple rects)
+                if "claims" in text.lower() or "claims" in uri.lower():
+                    if uri not in seen_claims_urls:
+                        seen_claims_urls.add(uri)
+                        claims_urls.append(uri)
+
+    return file_number_urls, claims_urls
+
+
 def parse_agenda(pdf_path):
     """Parse agenda PDF and return structured data."""
     doc = fitz.open(pdf_path)
+
+    # Extract hyperlinks before text parsing
+    file_number_urls, claims_urls = extract_links(doc)
 
     # Extract all text from all pages
     full_text = ""
@@ -466,6 +510,18 @@ def parse_agenda(pdf_path):
     if current_section:
         sections.append(current_section)
 
+    # Attach URLs to items
+    claims_index = 0
+    for section in sections:
+        for item in section["items"]:
+            url = None
+            if item["file_number"] and item["file_number"] in file_number_urls:
+                url = file_number_urls[item["file_number"]]
+            elif section["type"] == "claims" and claims_index < len(claims_urls):
+                url = claims_urls[claims_index]
+                claims_index += 1
+            item["url"] = url
+
     doc.close()
 
     return {
@@ -492,8 +548,14 @@ def main():
         for item in s["items"]
         if item["page_start"] is not None
     )
+    items_with_urls = sum(
+        1 for s in result["sections"]
+        for item in s["items"]
+        if item.get("url")
+    )
     print(f"Parsed {total_items} items across {len(result['sections'])} sections")
     print(f"  {items_with_pages} items have page ranges")
+    print(f"  {items_with_urls} items have URLs")
 
     # Detail per section
     for s in result["sections"]:
