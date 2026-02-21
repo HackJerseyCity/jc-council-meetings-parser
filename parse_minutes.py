@@ -118,9 +118,10 @@ def extract_named_members(text, roster):
     - 'Council president pro temp Gilmore, Councilperson Lavarro, and Councilperson Griffin: nay'
     """
     found = []
-    # Match "Councilperson <Name>" or "Council president pro temp <Name>"
+    # Match "Councilperson <Name>", "Council president pro temp <Name>",
+    # "Council person at large <Name>"
     for m in re.finditer(
-        r'(?:Councilperson|Council\s+president\s+pro\s+temp)\s+([A-Z][a-z]+)',
+        r'(?:Council\s*person(?:\s+at\s+large)?|Council\s+president\s+pro\s+temp)\s+([A-Z][a-z]+)',
         text, re.IGNORECASE
     ):
         name = m.group(1)
@@ -145,17 +146,25 @@ def build_vote_breakdown(result, tally_str, detail_text, roster):
         "absent": [],
     }
 
-    # Determine which members voted nay or abstained from the detail text
+    # Determine which members voted nay or abstained from the detail text.
+    # Detail may contain both nay and abstain sections, e.g.:
+    # "Councilperson Singh: nay Council person at large Brooks ...: Abstain"
     named_nay = []
     named_abstain = []
 
     if detail_text:
-        detail_lower = detail_text.lower()
-        named = extract_named_members(detail_text, roster)
-        if 'nay' in detail_lower:
-            named_nay = named
-        elif 'abstain' in detail_lower:
-            named_abstain = named
+        # Split detail into segments by vote keywords (nay/abstain)
+        # and assign names in each segment to the appropriate list.
+        segments = re.split(r':\s*(nay|abstain)', detail_text, flags=re.IGNORECASE)
+        # segments alternates: [text_before_keyword, keyword, text_before_next, keyword, ...]
+        for idx in range(0, len(segments) - 1, 2):
+            segment_text = segments[idx]
+            keyword = segments[idx + 1].lower()
+            names = extract_named_members(segment_text, roster)
+            if keyword == 'nay':
+                named_nay.extend(names)
+            elif keyword == 'abstain':
+                named_abstain.extend(names)
 
     # Build lists
     # Start by assuming everyone voted aye, then adjust
@@ -173,22 +182,55 @@ def build_vote_breakdown(result, tally_str, detail_text, roster):
     absent_count = total_roster - total_present
 
     # The remaining roster members who aren't named as nay/abstain
-    # and aren't absent voted aye
     remaining = [m for m in roster if m not in accounted]
 
-    # If we need absent members but don't have names, we can't assign them.
-    # However: if total_present < total_roster, some are absent.
-    # We won't have their names here unless we parsed the roll call.
-    # For now, mark as aye if present.
-    if absent_count > 0 and len(remaining) > ayes_count:
-        # We have more remaining members than aye votes - some must be absent.
-        # Without named absences, we can only list the aye count.
-        votes["aye"] = remaining[:ayes_count]
-        votes["absent"] = remaining[ayes_count:]
-    else:
-        votes["aye"] = remaining
+    # Use tally counts to distribute remaining members correctly.
+    # First assign ayes (capped by ayes_count), then fill any remaining
+    # nay/abstain slots, then mark the rest absent.
+    votes["aye"] = remaining[:ayes_count]
+    leftover = remaining[ayes_count:]
+
+    remaining_nay = nays_count - len(votes["nay"])
+    if remaining_nay > 0:
+        votes["nay"].extend(leftover[:remaining_nay])
+        leftover = leftover[remaining_nay:]
+
+    remaining_abstain = abstain_count - len(votes["abstain"])
+    if remaining_abstain > 0:
+        votes["abstain"].extend(leftover[:remaining_abstain])
+        leftover = leftover[remaining_abstain:]
+
+    votes["absent"] = leftover
 
     return votes
+
+
+def extract_urls(doc, max_pages=20):
+    """Extract embedded URLs from the PDF, keyed by item number.
+
+    Uses link annotations and nearby text to associate each URL with its
+    agenda item number (e.g., '10.15').  Duplicate URLs for the same item
+    are collapsed.
+    """
+    item_re = re.compile(r'(\d{1,2}\.\d{1,2})')
+    urls = {}
+    pages_to_read = min(len(doc), max_pages)
+    for page_num in range(pages_to_read):
+        page = doc[page_num]
+        for link in page.get_links():
+            uri = link.get('uri')
+            if not uri:
+                continue
+            rect = link['from']
+            # Look at text to the left of the link on the same line
+            search_rect = fitz.Rect(0, rect.y0 - 5, rect.x0, rect.y1 + 5)
+            nearby = page.get_text('text', clip=search_rect).strip()
+            m = item_re.search(nearby)
+            if m:
+                item_num = m.group(1)
+                if item_num not in urls:
+                    urls[item_num] = uri
+    return urls
 
 
 def parse_minutes(pdf_path, max_pages=20):
@@ -203,6 +245,7 @@ def parse_minutes(pdf_path, max_pages=20):
 
     meeting_info = extract_meeting_info(full_text)
     roster = extract_roster(full_text)
+    item_urls = extract_urls(doc, max_pages)
 
     lines = full_text.split("\n")
     end_idx = find_minutes_end(lines)
@@ -222,9 +265,9 @@ def parse_minutes(pdf_path, max_pages=20):
     file_number_re = re.compile(r'((?:Ord|Res)\.\s*\d{2}-\d{3})')
 
     # Vote result patterns
-    # "Introduced 9-0", "Approved 9-0", "Withdrawn 9-0", "Withdrawn", "Approved 8-1  detail"
+    # "Introduced 9-0", "Adopted 9-0", "Approved 9-0", "Withdrawn 9-0", "Withdrawn", "Approved 8-1  detail"
     vote_re = re.compile(
-        r'^\s*(Introduced|Approved|Withdrawn|Defeated|Tabled|Postponed)'
+        r'^\s*(Introduced|Adopted|Approved|Withdrawn|Defeated|Tabled|Postponed|Passed|Carried)'
         r'(?:\s*[-–]?\s*(\d+-\d+(?:-\d+)?))?'
         r'(?:\s{2,}(.+))?',
         re.IGNORECASE
@@ -325,8 +368,10 @@ def parse_minutes(pdf_path, max_pages=20):
                         kstripped = item_lines[k].strip()
                         if not kstripped:
                             continue
-                        # Continuation of vote detail (e.g., "Councilperson Lavarro, and...")
-                        if re.match(r'^(?:Councilperson|Council\s+president|and\s+Councilperson)', kstripped, re.IGNORECASE):
+                        # Continuation of vote detail (e.g., "Councilperson Lavarro, and..."
+                        # or "Gilmore, Council person at large Brooks..."
+                        # or "Abstain" / "nay" on its own line)
+                        if re.match(r'^(?:Council\s*person|Council\s+president|and\s+Council|[A-Z][a-z]+,\s|(?:nay|abstain)\s*$)', kstripped, re.IGNORECASE):
                             vote_detail_parts.append(kstripped)
                         else:
                             break
@@ -355,7 +400,7 @@ def parse_minutes(pdf_path, max_pages=20):
             # Also handles ": -9-0" (missing result keyword, treat as approved)
             if not found_vote:
                 combined = " ".join(il.strip() for il in item_lines)
-                cm = re.search(r'(Approved|Withdrawn|Defeated)\s*[-–]?\s*(\d+-\d+(?:-\d+)?)', combined, re.IGNORECASE)
+                cm = re.search(r'(Adopted|Approved|Withdrawn|Defeated|Passed|Carried)\s*[-–]?\s*(\d+-\d+(?:-\d+)?)', combined, re.IGNORECASE)
                 if cm:
                     vote_result = cm.group(1).capitalize()
                     vote_tally = cm.group(2)
@@ -405,6 +450,8 @@ def parse_minutes(pdf_path, max_pages=20):
                 "result": vote_result.lower() if vote_result else None,
                 "vote_tally": vote_tally,
             }
+            if item_number in item_urls:
+                item_data["url"] = item_urls[item_number]
             if votes is not None:
                 item_data["votes"] = votes
             if vote_detail:
