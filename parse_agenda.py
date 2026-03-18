@@ -43,6 +43,8 @@ def extract_meeting_info(text):
 def classify_section(number, title):
     """Classify a section by its number and title into a normalized type."""
     title_lower = title.lower().strip()
+    if "public request" in title_lower:
+        return "public_hearing"
     if "first reading" in title_lower:
         return "ordinance_first_reading"
     if "second reading" in title_lower or "hearing" in title_lower:
@@ -51,8 +53,6 @@ def classify_section(number, title):
         return "claims"
     if "resolution" in title_lower:
         return "resolutions"
-    if "public request" in title_lower:
-        return "public_hearing"
     if "petition" in title_lower or "communication" in title_lower:
         return "petitions_communications"
     if "officers" in title_lower:
@@ -87,13 +87,14 @@ def extract_links(doc):
     Returns:
         file_number_urls: dict mapping normalized file number (e.g. "Ord. 26-009")
                           to URL string
-        claims_urls: list of (url, link_text) for claims-related links, in page order
+        item_number_urls: dict mapping item number (e.g. "3.3") to URL string,
+                          used as fallback when file number is missing from link text
     """
     file_number_urls = {}
-    claims_urls = []
-    seen_claims_urls = set()
+    item_number_urls = {}
 
     file_num_in_link = re.compile(r'((?:Ord|Res)\.?\s*\d{2}-\d{3})')
+    item_num_re = re.compile(r'(\d{1,2}\.\d{1,3})')
 
     for page in doc:
         for link in page.get_links():
@@ -112,14 +113,19 @@ def extract_links(doc):
                 normalized = re.sub(r'(Ord|Res)\.?\s*', r'\1. ', raw)
                 file_number_urls[normalized] = uri
             else:
-                # Non-file-number links (claims, meeting links, etc.)
-                # Deduplicate by URL for claims (same URL spans multiple rects)
-                if "claims" in text.lower() or "claims" in uri.lower():
-                    if uri not in seen_claims_urls:
-                        seen_claims_urls.add(uri)
-                        claims_urls.append(uri)
+                # No file number in link text (e.g. "Ord. - Pdf", claims, addenda).
+                # Match by item number using text on the same row to the left.
+                same_row = fitz.Rect(0, rect.y0 - 5, rect.x0, rect.y1 + 5)
+                context = page.get_text("text", clip=same_row).strip()
+                matches = list(item_num_re.finditer(context))
+                if matches:
+                    item_num = matches[-1].group(1)
+                    # Keep first URL per item number (avoid duplicates from
+                    # split link rects like "Res. 26-045 -" + "Withdrawn - Pdf")
+                    if item_num not in item_number_urls:
+                        item_number_urls[item_num] = uri
 
-    return file_number_urls, claims_urls
+    return file_number_urls, item_number_urls
 
 
 def parse_agenda(pdf_path):
@@ -127,7 +133,7 @@ def parse_agenda(pdf_path):
     doc = fitz.open(pdf_path)
 
     # Extract hyperlinks before text parsing
-    file_number_urls, claims_urls = extract_links(doc)
+    file_number_urls, item_number_urls = extract_links(doc)
 
     # Extract all text from all pages
     full_text = ""
@@ -139,6 +145,10 @@ def parse_agenda(pdf_path):
 
     lines = full_text.split("\n")
 
+    # Strip "Page X of Y" footers from lines
+    page_footer_re = re.compile(r'\s*Page\s+\d+\s+of\s+\d+\s*')
+    lines = [page_footer_re.sub('', l) for l in lines]
+
     # Regex patterns
     section_re = re.compile(r'^\s*(\d{1,2})\.\s+([A-Z][A-Z\s\-\(\),&]+)')
 
@@ -146,7 +156,7 @@ def parse_agenda(pdf_path):
     # e.g., "130 - 136 10.1 A Resolution authorizing..."
     pattern_a = re.compile(
         r'^\s*(\d{1,3})\s*-\s*(\d{1,3})\s+'
-        r'(\d{1,2}\.\d{1,2})\s+'
+        r'(\d{1,2}\.\d{1,3})\s+'
         r'(.+)'
     )
 
@@ -154,7 +164,7 @@ def parse_agenda(pdf_path):
     # e.g., "106 - 129 9.1 " then "Meeting Claims List"
     pattern_b_range_item = re.compile(
         r'^\s*(\d{1,3})\s*-\s*(\d{1,3})\s+'
-        r'(\d{1,2}\.\d{1,2})\s*$'
+        r'(\d{1,2}\.\d{1,3})\s*$'
     )
 
     # Pattern C: page range alone on one line, item number on next
@@ -163,11 +173,11 @@ def parse_agenda(pdf_path):
 
     # Item number alone on a line (may have title or not)
     # e.g., "3.1 " or "5.1 " (title on next line)
-    item_number_alone = re.compile(r'^\s*(\d{1,2}\.\d{1,2})\s*$')
+    item_number_alone = re.compile(r'^\s*(\d{1,2}\.\d{1,3})\s*$')
 
     # Item number with title on same line (no page range)
     # e.g., "5.10 Eve Taylor" or "8.13 Letter dated..."
-    item_with_title = re.compile(r'^\s*(\d{1,2}\.\d{1,2})\s+(.+)')
+    item_with_title = re.compile(r'^\s*(\d{1,2}\.\d{1,3})\s+(.+)')
 
     # File number pattern
     file_number_re = re.compile(r'((?:Ord|Res)\.\s*\d{2}-\d{3})')
@@ -453,12 +463,21 @@ def parse_agenda(pdf_path):
             title = " ".join(title_parts)
             title = re.sub(r'\s+', ' ', title).strip()
 
+            file_number = None
+            for j in range(i, min(i + 3, len(lines))):
+                fm = file_number_re.search(lines[j])
+                if fm:
+                    file_number = fm.group(1)
+                    file_number = re.sub(r'(Ord|Res)\.\s*', r'\1. ', file_number)
+                    i = j + 1
+                    break
+
             current_section["items"].append({
                 "item_number": item_number,
                 "title": title,
                 "page_start": None,
                 "page_end": None,
-                "file_number": None,
+                "file_number": file_number,
                 "item_type": itype,
             })
             continue
@@ -494,12 +513,21 @@ def parse_agenda(pdf_path):
             title = " ".join(title_parts)
             title = re.sub(r'\s+', ' ', title).strip()
 
+            file_number = None
+            for j in range(i, min(i + 3, len(lines))):
+                fm = file_number_re.search(lines[j])
+                if fm:
+                    file_number = fm.group(1)
+                    file_number = re.sub(r'(Ord|Res)\.\s*', r'\1. ', file_number)
+                    i = j + 1
+                    break
+
             current_section["items"].append({
                 "item_number": item_number,
                 "title": title,
                 "page_start": None,
                 "page_end": None,
-                "file_number": None,
+                "file_number": file_number,
                 "item_type": itype,
             })
             continue
@@ -511,15 +539,13 @@ def parse_agenda(pdf_path):
         sections.append(current_section)
 
     # Attach URLs to items
-    claims_index = 0
     for section in sections:
         for item in section["items"]:
             url = None
             if item["file_number"] and item["file_number"] in file_number_urls:
                 url = file_number_urls[item["file_number"]]
-            elif section["type"] == "claims" and claims_index < len(claims_urls):
-                url = claims_urls[claims_index]
-                claims_index += 1
+            elif item["item_number"] in item_number_urls:
+                url = item_number_urls[item["item_number"]]
             item["url"] = url
 
     doc.close()
